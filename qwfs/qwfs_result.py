@@ -12,6 +12,7 @@ class QWFSResult:
         self.N_pixels = None
         # results.shape == N_T_methods, N_configs, N_tries, N_algos
         self.results = None
+        self.etas = None  # Will hold actual enhancement, not just power at end
         self.tot_power_results = None
         self.Ts = None
         self.max_SVDs = None
@@ -63,7 +64,8 @@ class QWFSResult:
         data = np.load(path, allow_pickle=True)
         self.__dict__.update(data)
 
-    def show_scatterplots(self, config_names=None, algo_names=None, T_names=None):
+    def show_scatterplots(self, config_names=None, algo_names=None, T_names=None, show_alg_names=False, mul_factor=1):
+        """ mul_factor is for multipying / dividing by N or N^2 depending on the dependence..."""
         fig, axes = plt.subplots(
             len(self.T_methods),
             len(self.configs),
@@ -81,10 +83,10 @@ class QWFSResult:
         colors = plt.cm.Set1(np.linspace(0, 1, len(self.algos)))
 
         # Reference lines
-        reference_lines = [np.pi/4, (np.pi/4)**2, 1]
+        reference_lines = [np.pi/4, (np.pi/4)**2, 1, (np.pi/8)**2]
         # Line styles for reference lines
-        line_styles = ['--', ':', '-']
-        line_colors = ['gray', 'gray', 'black']
+        line_styles = ['--', ':', '-', '-']
+        line_colors = ['gray', 'gray', 'black', 'gray']
 
         # Loop over T_methods and configurations
         for t_method_idx, t_method in enumerate(self.T_methods):
@@ -96,7 +98,7 @@ class QWFSResult:
                     ax.axhline(y=line_val, color=line_color, linestyle=line_style, alpha=0.5)
 
                 # Get data for this T_method and configuration
-                data = self.results[t_method_idx, config_idx, :, :]  # Shape: (N_tries, N_algos)
+                data = self.results[t_method_idx, config_idx, :, :]  * mul_factor # Shape: (N_tries, N_algos)
 
                 # Scatter plot for each algorithm
                 for algo_idx, algo in enumerate(self.algos):
@@ -106,7 +108,8 @@ class QWFSResult:
                         alpha=0.3, s=10,  label=algo if algo_names is None else algo_names[algo_idx])
                 ax.set_ylim(bottom=0)
                 ax.set_title(f'{config if config_names is None else config_names[config_idx]}')
-                ax.set_xticks(range(len(self.algos)))
+                if show_alg_names:
+                    ax.set_xticks(range(len(self.algos)))
                 ax.set_xticklabels(self.algos if algo_names is None else algo_names, rotation=45, ha='right')
 
                 if config_idx == 0:
@@ -116,9 +119,9 @@ class QWFSResult:
         return fig
 
 
-    def print(self, only_slm3=False):
+    def print(self, mul_SLM1=False, which_configs=None):
         for config_no, config in enumerate(self.configs):
-            if only_slm3 and config != 'SLM3':
+            if which_configs is not None and config not in which_configs:
                 continue
             print(f'---- {config} ----')
             for T_method_no, T_method in enumerate(self.T_methods):
@@ -126,6 +129,9 @@ class QWFSResult:
                 for algo_no, algo in enumerate(self.algos):
                     avg = self.results[T_method_no, config_no].mean(axis=0)[algo_no]
                     std = self.results[T_method_no, config_no].std(axis=0)[algo_no]
-
+                    if config == 'SLM1' and mul_SLM1:
+                        avg *= self.N_modes
+                        std *= self.N_modes
                     print(f'{algo:<25} {avg:.3f}+-{std:.2f}')
+
             print()

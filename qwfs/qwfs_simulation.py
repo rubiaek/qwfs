@@ -32,7 +32,12 @@ class QWFSSimulation:
         self.v_in = 1/np.sqrt(self.N) * np.ones(self.N, dtype=np.complex128)
         self.slm_phases = np.exp(1j*np.zeros(self.N, dtype=np.complex128))
         self.f_calls = 0
+        # default of full Schmidt rank, K=N
+        self.schmidt_mask = np.ones(self.N, dtype=float)
 
+    def set_schmidt_rank(self, K):
+        self.schmidt_mask = np.zeros(self.N, dtype=float)
+        self.schmidt_mask[:K] = 1
 
     def get_diffuser(self):
         if self.T_method == 'gaus_iid':
@@ -58,12 +63,14 @@ class QWFSSimulation:
         fft = torch.fft.fft if use_torch else np.fft.fft
 
         if self.config == 'SLM1':
-            after_T = self.T @ self.T.transpose() @ (self.slm_phases * self.v_in)
+            at_crystal = self.T.transpose() @ (self.slm_phases * self.v_in)
+            after_T = self.T @ (at_crystal * self.schmidt_mask)
             v_out = fft(after_T) / np.sqrt(self.N)
         elif self.config == 'SLM1-only-T':
             v_out = self.T @ (self.slm_phases * self.v_in)
         elif self.config == 'SLM2' or self.config == 'SLM2-same-mode':
-            after_T2 = self.T @ (self.slm_phases * (self.T.transpose() @ self.v_in))
+            at_crystal = self.slm_phases * (self.T.transpose() @ self.v_in)
+            after_T2 = self.T @ (at_crystal * self.schmidt_mask * self.slm_phases)
             v_out = fft(after_T2) / np.sqrt(self.N)
         elif self.config == 'SLM2-simple':
             v_in_one_hot = np.zeros_like(self.v_in)
@@ -74,13 +81,20 @@ class QWFSSimulation:
             v_in_one_hot[self.DEFAULT_OUT_MODE] = 1  # this assumes that we try to optimize the self.DEFAULT_OUT_MODE
             v_out = self.T @ (self.slm_phases * (self.T.transpose() @ v_in_one_hot))
         elif self.config == 'SLM3' or self.config == 'SLM3-same-mode':
-            after_SLM_second_time = self.slm_phases * (self.T @ self.T.transpose() @ (self.slm_phases * self.v_in))
+            at_crystal = self.T.transpose() @ (self.slm_phases * self.v_in)
+            after_SLM_second_time = self.slm_phases * (self.T @ (at_crystal * self.schmidt_mask))
             v_out = fft(after_SLM_second_time) / np.sqrt(self.N)
         elif self.config == 'SLM5' or self.config == 'SLM5-same-mode':
             # a general mixing between SLM2 modes, when SLM2 is not at the crystal plane
             after_slm1 = self.slm_phases * (self.T.transpose() @ self.v_in)
             after_ft1 = fft(after_slm1) / np.sqrt(self.N)
             after_T2 = self.T @ (self.slm_phases * after_ft1)
+            v_out = fft(after_T2) / np.sqrt(self.N)
+        elif self.config == 'SLM2-ff' or self.config == 'SLM2-ff-same-mode':
+            after_slm1 = self.slm_phases * (self.T.transpose() @ self.v_in)
+            at_crystal = fft(after_slm1) / np.sqrt(self.N)
+            at_slm_again = fft(at_crystal * self.schmidt_mask) / np.sqrt(self.N)
+            after_T2 = self.T @ (self.slm_phases * at_slm_again)
             v_out = fft(after_T2) / np.sqrt(self.N)
         else:
             raise NotImplementedError('WAT?')
@@ -179,15 +193,18 @@ class QWFSSimulation:
         prev_cost = float('inf')
         patience = 10  # Number of iterations to wait for improvement
         patience_counter = 0
-        eps_stop = 1e-6
+        eps_stop = 1e-7
 
         dtype = torch.complex128
         self.T = torch.tensor(self.T, dtype=dtype, requires_grad=False)
         self.v_in = torch.tensor(self.v_in, dtype=dtype, requires_grad=False)
+        self.schmidt_mask = torch.tensor(self.schmidt_mask, dtype=dtype, requires_grad=False)
 
         def closure():
             optimizer.zero_grad()
             cost = self.get_intensity(phases, out_mode=out_mode, use_torch=True)
+            # Assuring step size is somewhat consistent for different K
+            cost *= self.N / self.schmidt_mask.sum().item().real
             cost.backward()
             return cost
 
@@ -220,8 +237,10 @@ class QWFSSimulation:
         """Ensure all attributes are reset to NumPy arrays."""
         self.T = self.T.detach().numpy() if isinstance(self.T, torch.Tensor) else self.T
         self.v_in = self.v_in.detach().numpy() if isinstance(self.v_in, torch.Tensor) else self.v_in
-        self.slm_phases = self.slm_phases.detach().numpy() if isinstance(self.slm_phases,
-                                                                         torch.Tensor) else self.slm_phases
+        self.slm_phases = self.slm_phases.detach().numpy() if isinstance(self.slm_phases, torch.Tensor) \
+            else self.slm_phases
+        self.schmidt_mask = self.schmidt_mask.detach().numpy() if isinstance(self.schmidt_mask, torch.Tensor) \
+            else self.schmidt_mask
 
     def statistics(self, algos, configs, T_methods, N_tries=1, saveto_path=None, verbose=False,
                    save_Ts=False, save_phases=True):
@@ -240,6 +259,7 @@ class QWFSSimulation:
         N_T_methods = len(T_methods)
 
         qres.results = np.zeros((N_T_methods, N_configs, N_tries, N_algos))
+        qres.etas = np.zeros((N_T_methods, N_configs, N_tries, N_algos))
         qres.tot_power_results = np.zeros((N_T_methods, N_configs, N_tries, N_algos))
         qres.best_phases = np.zeros((N_T_methods, N_configs, N_tries, N_algos, self.N))
         Ts = []
@@ -261,22 +281,25 @@ class QWFSSimulation:
                     for algo_no, algo in enumerate(algos):
                         start_t = time.time()
                         self.slm_phases = np.exp(1j * np.zeros(self.N, dtype=np.complex128))
-                        if config == 'SLM3-same-mode' or config == 'SLM1-same-mode' or config == 'SLM2-same-mode' or config == 'SLM5-same-mode':
+                        if (config == 'SLM3-same-mode' or config == 'SLM1-same-mode' or config == 'SLM2-same-mode' or
+                                config == 'SLM5-same-mode' or config == 'SLM2-ff-same-mode'):
                             # this is the equivalent output mode after fourier to the default input of flat phase ones
                             out_mode = 0
                         else:
                             out_mode = self.DEFAULT_OUT_MODE
+                        v_before = self.propagate()
+                        I_before = np.abs(v_before[out_mode]) ** 2
                         I, res = self.optimize(algo=algo, out_mode=out_mode)
                         v_out = self.propagate()
                         I_good = np.abs(v_out[out_mode]) ** 2
                         I_tot = (np.abs(v_out) ** 2).sum()
                         qres.results[T_method_no, config_no, try_no, algo_no] = I_good
+                        qres.etas[T_method_no, config_no, try_no, algo_no] = I_good / I_before
                         qres.tot_power_results[T_method_no, config_no, try_no, algo_no] = I_tot
                         qres.best_phases[T_method_no, config_no, try_no, algo_no] = np.angle(self.slm_phases)
                         T = time.time()-start_t
                         if verbose:
                             print(f"{T_method:<12} {algo:<20} {config:<16} {I_good:<8.4f} {self.f_calls:<8} {T:<5.2f}")
-
 
 
             qres.Ts = np.array(Ts)
